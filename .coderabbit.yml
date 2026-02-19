@@ -1,14 +1,8 @@
-language: typescript
-review:
-  focus:
-    - bugs
-    - security
-    - performance
-    - readability
-    - complexity
+language: en-US
+reviews:
   path_filters:
     - "!node_modules/**"
     - "!dist/**"
     - "src/**/*.{ts,tsx}"
 chat:
-  enabled: true
+  auto_reply: true
