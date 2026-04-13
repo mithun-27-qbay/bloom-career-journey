@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Navigate } from 'react-router-dom';
 import { useAuth } from '@/hooks/useAuth';
+import { useMsg91 } from '@/hooks/useMsg91';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -10,12 +11,19 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { BookOpen, Users, GraduationCap } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
 import { SchoolInfo, SchoolClass } from '@/integrations/supabase/types';
+import { InputOTP, InputOTPGroup, InputOTPSlot } from '@/components/ui/input-otp';
+import { REGEXP_ONLY_DIGITS } from 'input-otp';
+
 
 export default function AuthPage() {
   console.log('AuthPage: Component rendering');
   
   const { user, userProfile, signIn, signUp } = useAuth();
+  const { isReady, isVerifying, verifiedToken, openWidget, sendOtpCode, verifyOtpCode, verifyTokenWithBackend, resetVerification } = useMsg91();
+  
   const [signInForm, setSignInForm] = useState({ identifier: '', password: '' });
+  const [otpSent, setOtpSent] = useState(false);
+  const [otpCode, setOtpCode] = useState('');
   const [signUpForm, setSignUpForm] = useState({ 
     identifier: '', 
     password: '', 
@@ -29,6 +37,17 @@ export default function AuthPage() {
   const [schools, setSchools] = useState<SchoolInfo[]>([]);
   const [classes, setClasses] = useState<SchoolClass[]>([]);
   const [loadingSchools, setLoadingSchools] = useState(false);
+
+  // MSG91: Determine if identifier is email or mobile
+  const isEmail = signUpForm.identifier.includes('@');
+  const isMobile = signUpForm.identifier.length >= 10 && !isEmail;
+
+  // Reset verification if identifier changes
+  useEffect(() => {
+    resetVerification();
+    setOtpSent(false);
+    setOtpCode('');
+  }, [signUpForm.identifier, resetVerification]);
 
   // Load schools on component mount
   useEffect(() => {
@@ -45,40 +64,28 @@ export default function AuthPage() {
     }
   }, [signUpForm.schoolId]);
 
-  // Load schools from database
+  // Load schools (states) from database
   const loadSchools = async () => {
-    console.log('Loading schools...');
+    console.log('Loading states as schools...');
     setLoadingSchools(true);
     try {
-      // Attempt 1: id, name, school_code
-      let { data, error } = await supabase
-        .from('schools')
-        .select('id, name, school_code')
+      // Primary attempt: using 'states' table which exists and has ILP data
+      const { data, error } = await supabase
+        .from('states')
+        .select('id, name, state_code')
         .order('name');
+
       if (error) {
-        console.warn('Primary school query failed, retrying without school_code:', error);
-        // Attempt 2: id, name
-        const retry = await supabase
-          .from('schools')
-          .select('id, name')
-          .order('name');
-        data = retry.data as any[] | null;
-        error = retry.error as any;
-      }
-      if (error) {
-        console.error('School query failed after retry:', error);
-        // As a final fallback, populate a minimal list so the page works
-        setSchools([
-          { school_id: 'fallback-1', school_name: 'ILP-Tamil Nadu', school_code: 'ILP-TN', org_name: '' },
-        ]);
+        console.error('States query failed:', error);
+        // Fallback to minimal list if table missing (though we verified it EXISTS)
+        setSchools([{ school_id: 'cef91711-ebd8-4552-b302-dfcfcdc382e0', school_name: 'ILP-Tamil Nadu', school_code: 'ILP-TN', org_name: '' }]);
         return;
       }
-      const rawSchools = (data || []).filter((s: any) => s && s.id && s.name);
-      const uniqueSchools = Array.from(new Map(rawSchools.map((s: any) => [s.id, s])).values());
-      const schoolsData = uniqueSchools.map((school: any) => ({
-        school_id: String(school.id),
-        school_name: String(school.name),
-        school_code: String((school as any).school_code || ''),
+
+      const schoolsData = (data || []).map((state: any) => ({
+        school_id: String(state.id),
+        school_name: String(state.name || state.state_name),
+        school_code: String(state.state_code || ''),
         org_name: ''
       }));
       setSchools(schoolsData);
@@ -90,16 +97,20 @@ export default function AuthPage() {
     }
   };
 
-  // Load classes for selected school
+  // Load classes for selected school (state)
   const loadClasses = async (schoolId: string) => {
     try {
-      console.log('Loading classes for school:', schoolId);
+      console.log('Loading classes for state:', schoolId);
+      
+      // Filter by state_id (confirmed schema name)
       const { data, error } = await supabase
         .from('classes')
         .select('id, name')
-        .eq('school_id', schoolId)
+        .eq('state_id', schoolId)
         .order('name');
+        
       if (error) throw error;
+      
       const rawClasses = (data || []).filter((r: any) => r && r.id && r.name);
       const uniqueClasses = Array.from(new Map(rawClasses.map((r: any) => [r.id, r])).values());
       const classesData = uniqueClasses.map((row: any) => ({
@@ -121,6 +132,23 @@ export default function AuthPage() {
     return <Navigate to={redirectPath} replace />;
   }
 
+  const handleSendOTP = async () => {
+    if (!signUpForm.identifier || isEmail) return;
+    const result = await sendOtpCode(signUpForm.identifier);
+    console.log('[Auth] handleSendOTP result:', result);
+    if (result.success) {
+      setOtpSent(true);
+    }
+  };
+
+  const handleVerifyOTP = async () => {
+    if (!otpCode || otpCode.length < 4) return;
+    const result = await verifyOtpCode(signUpForm.identifier, otpCode);
+    if (result.success) {
+      // verifiedToken is set to 'manual_verified' in the hook
+    }
+  };
+
   const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
@@ -135,6 +163,27 @@ export default function AuthPage() {
     e.preventDefault();
     setLoading(true);
     
+    // 1. MSG91: Require OTP Verification for Mobile users
+    if (isMobile) {
+      if (!verifiedToken) {
+        if (!otpSent) {
+          console.log('[Auth] Mobile detected, calling handleSendOTP');
+          await handleSendOTP();
+          setLoading(false);
+          return;
+        } else {
+          toast({
+            title: "Verification Required",
+            description: "Please enter and verify the 4-digit code first.",
+            variant: "destructive"
+          });
+          setLoading(false);
+          return;
+        }
+      }
+      console.log('[Auth] OTP verification confirmed');
+    }
+
     // Validate required fields based on role
     if (!signUpForm.schoolId) {
       console.error('School selection is required');
@@ -148,20 +197,19 @@ export default function AuthPage() {
       return;
     }
     
-    // Determine if identifier is email or mobile
-    const isEmail = signUpForm.identifier.includes('@');
     const email = isEmail ? signUpForm.identifier : null;
-    const mobile = !isEmail ? signUpForm.identifier : null;
+    const mobileValue = isMobile ? signUpForm.identifier : null;
     
     const { error } = await signUp(
-      mobile, 
+      mobileValue, 
       email, 
       signUpForm.password, 
       signUpForm.fullName, 
       signUpForm.role,
       signUpForm.schoolId,
       signUpForm.classId,
-      signUpForm.gender
+      signUpForm.gender,
+      !!verifiedToken // isMobileVerified
     );
     setLoading(false);
     if (error) {
@@ -237,15 +285,80 @@ export default function AuthPage() {
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="signup-identifier">Email Address / Mobile Number</Label>
-                    <Input
-                      id="signup-identifier"
-                      type="text"
-                      placeholder="Enter your email address or mobile number"
-                      value={signUpForm.identifier}
-                      onChange={(e) => setSignUpForm({ ...signUpForm, identifier: e.target.value })}
-                      required
-                    />
+                    <div className="flex gap-2">
+                      <Input
+                        id="signup-identifier"
+                        type="text"
+                        placeholder="Enter your email address or mobile number"
+                        value={signUpForm.identifier}
+                        onChange={(e) => setSignUpForm({ ...signUpForm, identifier: e.target.value })}
+                        required
+                        className="flex-1"
+                      />
+                      {isMobile && !verifiedToken && !otpSent && (
+                        <Button 
+                          type="button" 
+                          variant="outline" 
+                          onClick={handleSendOTP}
+                          disabled={isVerifying}
+                        >
+                          Verify
+                        </Button>
+                      )}
+                      {isMobile && !verifiedToken && otpSent && (
+                        <Button 
+                          type="button" 
+                          variant="default" 
+                          onClick={handleVerifyOTP}
+                          disabled={isVerifying || otpCode.length < 4}
+                        >
+                          Confirm
+                        </Button>
+                      )}
+                      {verifiedToken && (
+                        <div className="flex items-center text-green-600 text-sm font-medium px-2 bg-green-50 rounded border border-green-200">
+                          Verified ✓
+                        </div>
+                      )}
+                    </div>
                   </div>
+
+                  {isMobile && otpSent && !verifiedToken && (
+                    <div className="space-y-4 py-4 px-2 bg-primary/5 rounded-lg border border-primary/20 animate-in fade-in slide-in-from-top-2">
+                      <div className="flex items-center justify-between">
+                        <Label htmlFor="otp" className="font-semibold text-primary">Enter 4-Digit Verification Code</Label>
+                        <span className="text-[10px] bg-primary/10 text-primary px-2 py-0.5 rounded-full uppercase font-bold tracking-wider">Required</span>
+                      </div>
+                      
+                      <div className="flex justify-center py-2">
+                        <InputOTP
+                          maxLength={4}
+                          value={otpCode}
+                          onChange={(value) => setOtpCode(value)}
+                          pattern={REGEXP_ONLY_DIGITS}
+                        >
+                          <InputOTPGroup className="gap-3">
+                            <InputOTPSlot index={0} className="w-12 h-14 text-xl font-bold border-2" />
+                            <InputOTPSlot index={1} className="w-12 h-14 text-xl font-bold border-2" />
+                            <InputOTPSlot index={2} className="w-12 h-14 text-xl font-bold border-2" />
+                            <InputOTPSlot index={3} className="w-12 h-14 text-xl font-bold border-2" />
+                          </InputOTPGroup>
+                        </InputOTP>
+                      </div>
+                      
+                      <div className="flex justify-between items-center text-sm text-muted-foreground">
+                        <p>Sent to <span className="font-medium text-foreground">+{signUpForm.identifier}</span></p>
+                        <button 
+                          type="button" 
+                          onClick={handleSendOTP} 
+                          className="text-primary font-medium hover:underline flex items-center gap-1"
+                          disabled={isVerifying}
+                        >
+                          {isVerifying ? 'Sending...' : 'Resend Code'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   <div className="space-y-2">
                     <Label htmlFor="signup-password">Password</Label>
                     <Input

@@ -25,7 +25,8 @@ interface AuthContextType {
     role: 'teacher' | 'student',
     schoolId: string,
     classId?: string,
-    gender?: 'male' | 'female'
+    gender?: 'male' | 'female',
+    isMobileVerified?: boolean
   ) => Promise<{ error: any }>;
   signOut: () => Promise<void>;
   userProfile: any;
@@ -120,69 +121,47 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         hint: (insertError as any)?.hint,
       });
 
-      // 2) If FK violation on school_id (23503), retry without school_id (last resort)
       const code = (insertError as any)?.code;
       const message = (insertError as any)?.message || '';
-      let minimalPayload = { ...userData } as any;
-
-      if (code === '23503' && message.includes('school_id')) {
-        console.warn('Retrying insert without school_id due to FK violation');
-        /* remove school_id for retry */
-        delete minimalPayload.school_id;
-        const retry = await supabase.from('users').insert(minimalPayload);
+      
+      // If we got a column error (PGRST204) or FK error on school_id, try mapping to state_id
+      if ((code === '23503' || code === 'PGRST204') && message.includes('school_id')) {
+        console.warn('Handling school_id discrepancy by mapping to state_id');
+        const statePayload = { ...userData };
+        delete statePayload.school_id;
+        statePayload.state_id = userData.school_id;
+        
+        const retry = await supabase.from('users').insert(statePayload);
         if (!retry.error) {
-          console.log('User profile created successfully on retry without school_id');
+          console.log('User profile created successfully with state_id');
           return { success: true, error: null };
         }
         insertError = retry.error;
       }
 
-      // 3) If NOT NULL violation (23502) for optional fields, strip down to minimal payload
-      if (code === '23502') {
-        console.warn('Retrying insert with minimal payload due to NOT NULL violation');
-        minimalPayload = {
+      // If still failing with NOT NULL or other errors, try a truly minimal payload
+      if ((insertError as any)?.code === '23502' || insertError) {
+        console.warn('Final attempt with basic payload');
+        const finalPayload = {
           id: userData.id,
-          password_hash: userData.password_hash || 'handled_by_auth',
           role: userData.role,
           full_name: userData.full_name,
-          school_id: userData.school_id || null,
-        };
-        const retry = await supabase.from('users').insert(minimalPayload);
+          email: userData.email,
+        } as any;
+        
+        // Add state_id if we have it
+        if (userData.school_id) finalPayload.state_id = userData.school_id;
+        
+        const retry = await supabase.from('users').upsert(finalPayload, { onConflict: 'id' });
         if (!retry.error) {
-          console.log('User profile created successfully with minimal payload');
+          console.log('User profile created/upserted with final payload');
           return { success: true, error: null };
         }
         insertError = retry.error;
       }
 
-      // 4) As a last resort, upsert on conflict id (in case row was partially created elsewhere)
-      console.warn('Final attempt: upsert on id');
-      const upsert = await supabase
-        .from('users')
-        .upsert(
-          {
-            id: userData.id,
-            password_hash: userData.password_hash || 'handled_by_auth',
-            role: userData.role,
-            full_name: userData.full_name,
-            email: userData.email,
-            mobile: userData.mobile,
-            school_id: userData.school_id || null,
-          },
-          { onConflict: 'id' }
-        );
-      if (!upsert.error) {
-        console.log('User profile upserted successfully');
-        return { success: true, error: null };
-      }
-
-      console.error('All attempts to create user profile failed:', {
-        code: (upsert.error as any)?.code || code,
-        message: (upsert.error as any)?.message || message,
-        details: (upsert.error as any)?.details,
-        hint: (upsert.error as any)?.hint,
-      });
-      return { success: false, error: upsert.error || insertError };
+      console.error('All attempts to create user profile failed:', insertError);
+      return { success: false, error: insertError };
     } catch (error) {
       console.error('Error in createUserProfile:', error);
       return { success: false, error };
@@ -549,7 +528,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     role: 'teacher' | 'student',
     schoolId: string,
     classId?: string,
-    gender?: 'male' | 'female'
+    gender?: 'male' | 'female',
+    isMobileVerified: boolean = false
   ) => {
     try {
       console.log('Starting signUp process:', { mobile, email, fullName, role, schoolId, classId, gender });
@@ -641,14 +621,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       console.log('Supabase auth user created:', authData.user?.id);
 
       if (authData.user) {
-        // Insert into custom users table
-        console.log('Inserting user profile into database');
         const userProfileData: any = {
             id: authData.user.id,
             password_hash: 'handled_by_auth',
             role,
             full_name: fullName,
           school_id: schoolId,
+          is_mobile_verified: isMobileVerified
         };
         
         // Only add email and mobile if the columns exist
@@ -682,15 +661,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // Create role-specific profile (teacher or student)
         try {
           if (role === 'teacher') {
-            // Create teacher profile
-            const { error: teacherError } = await supabase
+            // Create teacher profile - handle school_id vs state_id
+            const teacherData: any = {
+              user_id: authData.user.id,
+              is_active: true,
+              joining_date: new Date().toISOString(),
+            };
+
+            // Try with school_id first
+            let { error: teacherError } = await supabase
               .from('teachers')
-              .insert({
-                user_id: authData.user.id,
-                school_id: schoolId,
-                is_active: true,
-                joining_date: new Date().toISOString(),
-              });
+              .insert({ ...teacherData, school_id: schoolId });
+
+            if (teacherError && ((teacherError as any).code === 'PGRST204' || (teacherError as any).code === '23503')) {
+              console.warn('Teacher insert failed with school_id, retrying with state_id');
+              const { error: retryError } = await supabase
+                .from('teachers')
+                .insert({ ...teacherData, state_id: schoolId });
+              teacherError = retryError;
+            }
 
             if (teacherError) {
               console.error('Error creating teacher profile:', teacherError);
